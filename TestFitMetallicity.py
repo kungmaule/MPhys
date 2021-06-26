@@ -1,0 +1,146 @@
+################################################################################
+
+"""             Thomas Stanton - Metallicity Fit NS Methodology            """
+
+################################################################################
+
+# Imports from libraries
+from astropy.table import Table
+import numpy as np
+import os, sys
+
+# Import Fitting libraries
+import dynesty
+from multiprocessing import Pool
+
+# Imports from Classes
+from SpectrumModel import SpectrumModel, Spline
+
+##### MCMC METHODS #############################################################
+
+def PriorTransform(u, ZMin, ZMax):
+    return ZMin + u*(ZMax-ZMin)
+
+def LogLikelihood(Z, Fluxes, Wavelengths, Errors, ModelArray, Mask):
+
+    # Get Model Fluxes at Z
+    ModelFluxes = InterpolateZModel(Z, ModelArray, Wavelengths)
+
+    # Mask All Arrays
+    Wavelengths = Wavelengths[Mask]
+    MaskFlux = Fluxes[Mask]
+    ModelMaskFluxes = ModelFluxes[Mask]
+    MaskErrors = Errors[Mask]
+
+    # Determins s^2
+    sigma2 = MaskErrors**2
+
+    # Return Log Likelihood
+    return -0.5 * np.sum(((MaskFlux - ModelMaskFluxes)**2 / sigma2) + np.log(2*np.pi*sigma2))
+
+def InterpolateZModel(Z, ModelArray, Wavelengths):
+
+    # Define initial Metallicity Array
+    ZArray = np.array([Model.Metallicity for Model in ModelArray])
+    # Generate Model based on Metallicity
+    Model = ModelArray[np.where(ZArray==Z)][0][0] if Z in ZArray else SpectrumModel.InterpolateModels(Z,ModelArray, Linear=True)
+    # Determine Continuum Spline
+    SplineModel = Model.DetermineContinuumSpline()
+
+    return SplineModel.RelativeFluxes
+
+##### METHODS ##################################################################
+
+def GenerateSteidelMask(Wavelengths):
+    ContinuumWindows = Table.read('Parameter Files/Windows/SteidelWindows.txt', format='ascii')
+    WindowWlMins = ContinuumWindows['wlmin']
+    WindowWlMaxs = ContinuumWindows['wlmax']
+
+    Mask = np.array([np.any((WindowWlMins <= wl) & (wl <= WindowWlMaxs)) for wl in Wavelengths])
+
+    return Mask
+
+##### MAIN METHOD ##############################################################
+
+# CHANGE TO PTAH FOR FULL FITS
+def FitMetallicity(m_id, model_type, Verbose=True): #m_id, p_id, model_type, Verbose=True):
+
+    # Generate Model Array
+    if model_type == 'S':
+        ZArray = np.array([0.001, 0.002, 0.008, 0.014, 0.040])
+        FWHM, Res = 3.0, 0.4 # 0.4Å Resolution
+        folderpath = r"./S99"
+        ResultPath = 'S99'
+    elif model_type == 'B':
+        ZArray = np.array([0.00001, 0.0001, 0.001, 0.002, 0.003, 0.004, 0.006, 0.008, 0.010, 0.014, 0.020, 0.030])
+        FWHM, Res = 3.0, 1.0 # 1Å Resolution
+        folderpath = r"./BPASS"
+        ResultPath = 'BPASS'
+    ZMin, ZMax = ZArray[0], ZArray[-1]
+
+    filepaths = [os.path.join(folderpath, name) for name in os.listdir(folderpath)]
+    ModelArray = np.empty(0)
+    ModelWavelengths = np.arange(1000, 2000, 1)
+    for count, path in enumerate(filepaths):
+        # Read in Data and generate SpectrumModel
+        Model = SpectrumModel.ReadInModelData(path, ZArray[count])
+        # Convolve and Resample
+        Model.ConvolveModel(FWHM=FWHM, PixelRes=Res)
+        Model.ResampleFluxToGrid(ModelWavelengths)
+        # Add Model to Array
+        ModelArray = np.append(ModelArray, Model)
+
+    # Read in Spectrum Data
+    SpectrumPath = f'VANDELS_SIM/UnperturbedStacks/vandels-m{m_id}-p0-allz.dat'
+
+    # Generate Model based upon test data + fit spline
+    StackModel = SpectrumModel.ReadInTestData(SpectrumPath)
+    StackSpline = StackModel.DetermineContinuumSpline()
+
+    # Assign Values to easier to reference variables
+    Flux = StackSpline.RelativeFluxes
+    Wavelengths = StackSpline.Wavelengths
+    Errors = StackSpline.Errors
+
+    # Define Steidel Mask
+    Mask = GenerateSteidelMask(Wavelengths)
+
+    # Run Nested Sampling
+    with Pool() as pool:
+        sampler = dynesty.NestedSampler(LogLikelihood, PriorTransform, ndim=1, logl_args=(Flux, Wavelengths, Errors, ModelArray, Mask), ptform_args=(ZMin, ZMax), pool=pool, queue_size=6)
+        sampler.run_nested(print_progress=Verbose)
+
+    # Collect Results + Define Weights
+    Results = sampler.results
+    Weights = np.exp(Results['logwt'] - Results['logz'][-1])
+
+    # Determine Metallicity and Posteriors
+    metallicity = dynesty.utils.quantile(x=Results['samples'][:,0], q=[0.16, 0.50, 0.84], weights=Weights)
+    samples_equal = dynesty.utils.resample_equal(Results['samples'], Weights)
+
+    # Output if Verbose
+    if Verbose == True: print(metallicity)
+
+    # Record Metallicity Data
+    with open(f'VANDELS_SIM/UnperturbedStacks/Results/Results.txt', 'a') as file:
+        file.write(f'{m_id}, {metallicity[0]}, {metallicity[1]}, {metallicity[2]}\n')
+
+    with open(f'VANDELS_SIM/UnperturbedStacks/Results/SolarResults.txt', 'a') as file:
+        file.write(f'{m_id}, {metallicity[1]/0.0142}\n')
+
+    # Record Posterior Data
+    posterior = np.empty(0)
+    for arr in samples_equal:
+        posterior = np.append(posterior, arr)
+    OutputTable = Table([posterior], names=['pos'])
+    OutputTable.write(f'VANDELS_SIM/UnperturbedStacks/Results/m{m_id}_Posterior.dat', format='ascii', overwrite=True)
+
+if __name__=="__main__":
+
+    # Running Parameters
+    #m = int(sys.argv[1])
+    p = 0
+    model = sys.argv[1]
+
+    for m in range(1,8):
+        FitMetallicity(m, model)
